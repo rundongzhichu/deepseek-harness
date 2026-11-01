@@ -5,16 +5,22 @@
 ## 阅读导航
 
 - [项目简介](#项目简介)
+- [功能架构图](#功能架构图)
 - [总体架构](#总体架构)
 - [核心功能原理](#核心功能原理)
-- [开发实践步骤](#开发实践步骤)
+- [插件原理](#插件原理)
 - [关键概念源码实现详解](#关键概念源码实现详解)
+- [Agent Loop 详解](#agent-loop-详解)
+- [ACP（Agent Client Protocol）](#acpagent-client-protocol)
+- [Hooks 钩子桥接](#hooks-钩子桥接)
+- [开发实践步骤](#开发实践步骤)
 - [文件索引](#文件索引)
 - [命令速查](#命令速查)
 
 ---
 
 ## 项目简介
+
 
 ### 一句话概括
 
@@ -65,7 +71,80 @@ pnpm dsh web
 
 ---
 
+## 功能架构图
+
+
+把 profile 装配、Cordis 服务总线、能力接缝、Agent Loop、工具流水线、会话日志与多入口放在一张图里：
+
+```mermaid
+flowchart TB
+  subgraph Entry[入口]
+    WEB[Web UI]
+    SDK[JSON-RPC SDK]
+    ACP[ACP stdio]
+    HEAD[Headless CLI]
+  end
+
+  subgraph Assembly[装配层]
+    PROFILE[Profile / Bundles]
+    PATCH[cordis.patch.yml 叠加]
+  end
+
+  subgraph Bus[Cordis Context 服务总线]
+    LLM[ctx.llm]
+    TOOLS[ctx.tools]
+    SHELL[ctx.shell]
+    FS[ctx.fs]
+    SANDBOX[ctx.sandbox]
+    EVENTS[ctx.events]
+    SESSIONCTX[ctx.sessions]
+  end
+
+  subgraph Loop[Agent Loop]
+    INBOX[Inbox 投影]
+    PHASE[Phase 状态机]
+    PROMPT[system-prompt/assemble]
+    MODEL[model selection]
+    LOOPEXEC[tool executor]
+  end
+
+  subgraph Persist[持久化]
+    LOG[Session Event Log]
+    PROJ[ctx.sessionProjections]
+  end
+
+  WEB --> PROFILE
+  SDK --> PROFILE
+  ACP --> PROFILE
+  HEAD --> PROFILE
+  PROFILE --> PATCH
+  PATCH --> Bus
+
+  LLM -->|agent/request → llm/stream| LOOPEXEC
+  TOOLS --> LOOPEXEC
+  SHELL --> LOOPEXEC
+  FS --> LOOPEXEC
+  SANDBOX --> LOOPEXEC
+  EVENTS --> Loop
+
+  INBOX --> PHASE
+  PHASE --> PROMPT
+  PROMPT --> MODEL
+  MODEL --> LOOPEXEC
+  LOOPEXEC --> LOG
+  LOG --> PROJ
+  PROJ --> Entry
+```
+
+- 入口层：四种 profile 都是同一套插件的不同装配。
+- 服务总线：能力接缝以 `ctx.<key>` 形式存在，provider 可替换。
+- Agent Loop：消费 inbox、驱动 phase、组装提示、选择模型、调用工具执行器。
+- 持久化：loop 与工具流水线把事实写进日志，投影供 UI/SDK 读取。
+
+---
+
 ## 总体架构
+
 
 ### 一切都是插件
 
@@ -152,6 +231,48 @@ deepseek-harness/
 
 ## 核心功能原理
 
+### 基础概念关系（大白话）
+
+把这几个词按“从大到小、从装配到运行”串成一句话：
+
+```text
+profile（配方） 决定这次用哪些 bundle
+  → bundle（配件包） 打包一组插件和配置行
+    → plugin（功能模块） 被加载后执行 apply(ctx, config)
+      → fiber（插件管家） 记录这个插件做过的所有登记
+        → ctx（共享总线） 挂载和查找所有 service
+          → service（能力） 例如 ctx.llm / ctx.tools / ctx.shell
+          → effect（带撤销的登记） 返回 disposer，由 fiber 逆序撤销
+          → event（通信管道） 插件之间互相通知、拦截
+```
+
+- **profile**：决定“这次 `dsh` 长什么样”。它列出要叠哪些 bundle 和补丁层；`web`、`headless`、`sdk`、`acp` 就是不同的 profile。
+- **bundle**：把一组相关插件和它们的 `cordis.yml` 配置行打包，方便复用和叠加。
+- **plugin**：最小功能单元。函数、对象、类三种写法，加载时执行 `apply(ctx, config)`。
+- **fiber**：plugin 被加载后创建的运行时实例，像管家一样收集该插件做的所有 `effect`，卸载时按逆序全部撤销。
+- **ctx（Context）**：所有插件共享的“服务仓库”。插件把能力挂到 `ctx.xxx`，也从 `ctx.xxx` 取别人的能力。
+- **service**：挂在 `ctx` 上的一个可替换能力，如 `ctx.llm`、`ctx.tools`、`ctx.shell`。
+- **effect**：一次“可撤销的登记动作”。`ctx.on()`、`ctx.effect()`、注册服务都会返回 disposer；fiber 收集后逆序执行。
+- **inject**：插件启动前声明的“依赖清单”，等需要的 service 都就绪才加载。
+- **event**：类型化消息通道；`emit` / `parallel` / `serial` / `bail` / `waterfall` 决定通知方式。
+
+```mermaid
+flowchart LR
+  Profile[profile 配方] --> Bundle[bundle 配件包]
+  Bundle --> Plugin[plugin 功能模块]
+  Plugin --> Fiber[fiber 运行时管家]
+  Fiber --> Ctx[ctx 共享总线]
+  Ctx --> S1[service: ctx.llm]
+  Ctx --> S2[service: ctx.tools]
+  Ctx --> S3[service: ctx.shell]
+  Plugin --> Inject[inject 依赖清单]
+  Inject --> Ctx
+  Fiber --> Effect[effect: 收集 disposer]
+  Effect --> Undo[卸载时逆序撤销]
+  Ctx --> Event[event 通信管道]
+```
+
+
 ### Cordis 五大核心思想
 
 1. **插件是实现 `Service` 的对象**：可以是一个带 `inject` / `apply(ctx)` 的函数，也可以是 `Service` 子类。
@@ -181,6 +302,42 @@ flowchart LR
   C --> D[serial: 顺序]
   D --> E[bail: 首个 bail 停止]
 ```
+
+### 事件是怎么派发和运行的（大白话）
+
+一句话总结：**先注册到 `_hooks`，派发时先 `_resolve` 过滤出可见监听器，再按 `emit / parallel / serial / bail / waterfall` 五种模式之一运行。**
+
+- **注册**：插件调用 `ctx.on(name, listener)`，`EventsService` 把监听器按 `prepend` 决定头插/尾插，写进 `_hooks[name]`，并用 `ctx.fiber.effect()` 登记 disposer；插件卸载时自动 `unregister`。见 [`events.ts#L294`](../vendor/cordis/src/events.ts#L294)、[`events.ts#L263`](../vendor/cordis/src/events.ts#L263)。
+- **派发前解析**：`_resolve()` 先取可选的 `thisArg` 和事件名，再按 context filter 过滤出可见监听器，得到本次要跑的 callback 列表。见 [`events.ts#L162`](../vendor/cordis/src/events.ts#L162)。
+- **运行模式**：
+  - `emit`：同步顺序跑，忽略返回值（[events.ts#L203](../vendor/cordis/src/events.ts#L203)）。
+  - `parallel`：并发执行，`Promise.allSettled` 等全部结束，有错抛 `AggregateError`（[events.ts#L191](../vendor/cordis/src/events.ts#L191)）。
+  - `serial`：顺序 await，遇到首个 bail 值返回（[events.ts#L214](../vendor/cordis/src/events.ts#L214)）。
+  - `bail`：同步顺序跑，遇到首个 bail 值返回（[events.ts#L228](../vendor/cordis/src/events.ts#L228)）。
+  - `waterfall`：洋葱链；每个监听器收到 `(...args, next)`，调 `next()` 进入下一层，最终调用内置 `inner`；不调 `next()` 就短路，且 `next()` 重复调用会抛错（[events.ts#L246](../vendor/cordis/src/events.ts#L246)）。
+- **bail 判定**：返回值不是 `null` / `false` / `undefined` 就视为 bail（[events.ts#L12](../vendor/cordis/src/events.ts#L12)）。
+
+```mermaid
+flowchart TB
+  subgraph Register[注册阶段]
+    ON[ctx.on name, listener] --> PUSH[写入 _hooks name]
+    PUSH --> EFF[ctx.fiber.effect 登记 disposer]
+    EFF --> UNREG[卸载时 unregister]
+  end
+  subgraph Dispatch[派发阶段]
+    CALL[ctx.emit / parallel / serial / bail / waterfall] --> RESOLVE[_resolve 过滤可见监听器]
+    RESOLVE --> LIST[_hooks name 回调列表]
+    LIST --> MODE[按模式执行]
+  end
+  MODE --> EMIT[emit: 同步顺序, 忽略返回值]
+  MODE --> PARALLEL[parallel: Promise.allSettled 并发]
+  MODE --> SERIAL[serial: 顺序 await 到 bail]
+  MODE --> BAIL[bail: 同步到 bail]
+  MODE --> WATERFALL[waterfall: next 洋葱链]
+  WATERFALL --> NEXT[next 进入下一层, 不调即短路]
+```
+
+
 
 ### 能力接缝（Seam）
 
@@ -294,136 +451,51 @@ flowchart LR
 
 ---
 
-## 开发实践步骤
+## 插件原理
 
-### 阶段 0：把环境跑起来
 
-```sh
-git clone https://github.com/deepseek-ai/deepseek-harness.git
-cd deepseek-harness
-corepack enable          # 启用 pnpm 11.28.5
-pnpm install             # 安装依赖并配置 Lefthook hooks
-pnpm run typecheck       # 首次克隆后跑一次
-pnpm run build
-pnpm dsh web             # 起 Web UI（默认 http://127.0.0.1:3080）
-```
+Cordis 里“插件”是运行时组织单位：它声明依赖、贡献服务、监听事件、产生副作用，并随 fiber 卸载被撤销。源码在 vendored [`vendor/cordis/src/`](../vendor/cordis/src/)。
 
-前提：Node.js `>= 24.9` 且支持 TypeScript type stripping；不要用 `NODE_OPTIONS=--no-experimental-strip-types`。详见 [`docs/development.md`](../docs/development.md)。
+### 插件的三种形状
 
-### 阶段 1：先懂 Cordis
+- 函数插件：`(ctx, config) => disposer?`。
+- 对象插件：`{ apply(ctx, config), inject?, Config? }`；判定条件是 `apply` 是函数（[registry.ts#L9](../vendor/cordis/src/registry.ts#L9)）。
+- 类插件：继承 `Service`，构造器里 `super(ctx, name)` 注册服务。
 
-- 概念速查：读 [`docs/cordis-primer.md`](../docs/cordis-primer.md)。
-- 动手教程：从 [`docs/cordis-tutorial/index.md`](../docs/cordis-tutorial/index.md) 开始，逐章完成 7 个可运行示例：
+统一声明见 [`Plugin` 类型](../vendor/cordis/src/registry.ts#L91)，对象插件见 [registry.ts#L130-L132](../vendor/cordis/src/registry.ts#L130)。
 
-```text
-1. 第一个插件        —— 插件是一个函数，loader 挂载它
-2. 生命周期与副作用  —— 注册随插件卸载被撤销
-3. 服务             —— 在 ctx 上暴露能力，用 inject 依赖
-4. 事件             —— 类型化事件、广播、waterfall 短路
-5. 配置             —— 从 cordis.yml 校验配置，坏输入响亮失败
-6. 组合与 HMR       —— 配置作为插件树、热重载、诊断未加载
-7. 进入 harness     —— 对真实服务注册一个模型可调工具
-```
-
-教程目录就是本仓库的 `tmp/cordis-tutorial/`（gitignored），每个章节运行：
-
-```sh
-cd tmp/cordis-tutorial
-node --import tsx ../../vendor/cordis/bin.js
-```
-
-### 阶段 2：读懂整体架构
-
-- 必读 [`docs/architecture.md`](../docs/architecture.md)：profile/bundle、能力接缝、Agent 循环、会话日志、扩展点。
-- 看图：`docs/agent-lifecycle.md`、`docs/tool-execution-pipeline.md`、`docs/capability-seams.md`。
-- 看包图：`docs/module-graph.md`、`docs/graph-atlas.md`。
-
-### 阶段 3：掌握包布局
-
-- 总地图读 [`packages/README.md`](../packages/README.md)。
-- 重点先看 `packages/core/`：`agent`、`agent-loop`、`session`、`tools`、`system-prompt`。
-- 看一个接缝全家桶，推荐 `shell`：Service Definition → 本地 provider → 模型工具 Consumer。
-
-### 阶段 4：真实运行与最小改动
-
-```sh
-pnpm dsh --profile headless "summarize this workspace"   # 需要 DEEPSEEK_API_KEY
-pnpm run dev:web                                          # Web 热重载开发
-```
-
-最小改动练习（都带分步指南）：
-
-- [`docs/cookbook/adding-a-tool.md`](../docs/cookbook/adding-a-tool.md)：加一个模型工具。
-- [`docs/cookbook/adding-an-llm-adapter.md`](../docs/cookbook/adding-an-llm-adapter.md)：加 LLM adapter。
-- [`docs/cookbook/adding-a-package.md`](../docs/cookbook/adding-a-package.md)：加 npm 包。
-- [`docs/cookbook/adding-a-settings-card.md`](../docs/cookbook/adding-a-settings-card.md)：加设置页。
-
-### 阶段 5：按仓库规范贡献
-
-- 改 `packages/` 前必读 [`docs/architecture.md`](../docs/architecture.md)；文档改动遵循 [`docs/AGENTS.md`](../docs/AGENTS.md)。
-- 每次提交前跑“最小覆盖集”，不要默认全量测试：
-  - 行为改动 → 聚焦单测 + 快照。
-  - 文档 → `pnpm run doc-sync`。
-  - 发布路径/构建产物 → `pnpm run build` + `pnpm run hygiene`。
-- 非平凡改动必须在同一 PR 写 Agent Note，见 [`.agents/notes/README.md`](../.agents/notes/README.md)。
-
-### 学习路线图
+### 加载与生命周期
 
 ```mermaid
 flowchart TD
-  A[0. 环境跑通<br/>install / typecheck / build] --> B[1. Cordis 概念 + 教程 7 章]
-  B --> C[2. 总架构 architecture.md]
-  C --> D[3. 包布局 packages/README.md]
-  D --> E[4. 真实运行 headless / web]
-  E --> F[5. 最小改动：加工具 / adapter / 包]
-  F --> G[6. 测试与门禁 + Agent Note]
+  A[cordis.yml 声明插件] --> B[Loader 解析配置行]
+  B --> C[RegistryService.plugin 归一化形状]
+  C --> D[resolveConfig 校验 Config schema]
+  D -->|失败| E[ValidationError 响亮失败]
+  D -->|通过| F[Inject.resolve 等待依赖服务]
+  F --> G[创建 Fiber 并 apply / construct]
+  G --> H[ctx.effect / ctx.on 收集 disposer]
+  H --> I[运行中]
+  I --> J[插件卸载：disposer 逆序执行]
 ```
 
----
+- `RegistryService.plugin()` 创建 runtime 与 Fiber：见 [registry.ts#L307-L330](../vendor/cordis/src/registry.ts#L307)。
+- 配置校验在 fiber 启动前，失败抛 [`ValidationError`](../vendor/cordis/src/fiber.ts#L19)（[fiber.ts#L50](../vendor/cordis/src/fiber.ts#L50)）。
+- 依赖声明 [`Inject`](../vendor/cordis/src/registry.ts#L19) 由 [`Inject.resolve()`](../vendor/cordis/src/registry.ts#L71) 归一化；服务不满足时插件不会提前挂载。
 
-## 文件索引
+### 服务注册：`ctx.<key>`
 
-常用入口文件与目录（相对本手册的路径，点击可跳转）：
+`Service` 构造器最终调用 `ctx.reflect.provide(name, self, check)`（[service.ts#L42-L58](../vendor/cordis/src/service.ts#L42)），服务随 owning fiber 卸载自动移除。`Context` 构造器内置 `reflect / registry / events / logger` 四个服务（[context.ts#L70-L84](../vendor/cordis/src/context.ts#L70)）。
 
-- 项目总览：[`README.md`](../README.md)
-- 架构：[`docs/architecture.md`](../docs/architecture.md)
-- Cordis 概念：[`docs/cordis-primer.md`](../docs/cordis-primer.md)
-- Cordis 教程：[`docs/cordis-tutorial/index.md`](../docs/cordis-tutorial/index.md)
-- 开发指南：[`docs/development.md`](../docs/development.md)
-- 测试策略：[`docs/testing.md`](../docs/testing.md)
-- 能力接缝：[`docs/capability-seams.md`](../docs/capability-seams.md)
-- Agent 生命周期：[`docs/agent-lifecycle.md`](../docs/agent-lifecycle.md)
-- 工具流水线：[`docs/tool-execution-pipeline.md`](../docs/tool-execution-pipeline.md)
-- 包间依赖图：[`docs/module-graph.md`](../docs/module-graph.md)
-- 文档图索引：[`docs/graph-atlas.md`](../docs/graph-atlas.md)
-- 包分组：[`packages/README.md`](../packages/README.md)
-- 核心包：[`packages/core/README.md`](../packages/core/README.md)
-- 扩展指南目录：[`docs/cookbook/`](../docs/cookbook/)
-- 子系统参考：[`docs/subsystems/`](../docs/subsystems/)
-- Agent Notes：[`.agents/notes/README.md`](../.agents/notes/README.md)
-- 仓库门禁脚本：[`scripts/`](../scripts/)
+### 副作用与事件绑定
 
----
-
-## 命令速查
-
-| 命令 | 用途 |
-| --- | --- |
-| `pnpm run typecheck` | TypeScript 全量类型检查 |
-| `pnpm run lint` | oxlint |
-| `pnpm run test` | vitest 单元测试 |
-| `pnpm run test:coverage` | CI 覆盖率门禁 |
-| `pnpm run test:snapshot` | keyless 快照测试 |
-| `pnpm run build` | tsc + tsdown 产物构建 |
-| `pnpm run hygiene` | knip + publint + workspace 约束 |
-| `pnpm run doc-sync` | 文档全部门禁 |
-| `pnpm run duplication` | 跨文件 TS 克隆检测 |
-| `pnpm dsh web` | 从源码启动 Web UI |
-| `pnpm dsh --profile headless "task"` | 一次性 Headless 任务 |
+- [`Fiber.effect()`](../vendor/cordis/src/fiber.ts#L424) 收集 disposer，卸载时逆序执行（[fiber.ts#L433-L448](../vendor/cordis/src/fiber.ts#L433)）。
+- [`EventsService.on()`](../vendor/cordis/src/events.ts#L294) 通过 `fiber.effect()` 注册监听，卸载时 `unregister`（[events.ts#L263-L269](../vendor/cordis/src/events.ts#L263)）。
 
 ---
 
 ## 关键概念源码实现详解
+
 
 本节把前文概念落到源码，标注了可直接跳转的文件与行号（路径相对本手册，位于 `learnings/` 下，故以 `../` 开头）。
 
@@ -536,3 +608,294 @@ flowchart LR
   S --> V[wire.view 客户端视图]
   E2[next event] --> F
 ```
+
+---
+
+## Agent Loop 详解
+
+
+默认驱动是 [`ReactLoopAgent`](../packages/core/agent-loop/src/agent.ts#L112)：一个会话由 **turn → step** 两层边界驱动，输入来自可持久化的 inbox，每个请求都从会话日志重建。
+
+### 状态机
+
+```mermaid
+stateDiagram-v2
+  [*] --> idle
+  idle --> maintenance: 后台维护（abort 可控）
+  maintenance --> idle: 维护完成
+  idle --> running: inbox 有输入被唤醒
+  running --> running: 连续 step
+  running --> idle: turn 自然结束 / 无 next-step
+  running --> maintenance: 需要维护
+```
+
+状态定义与 `agent/status` 发布：[agent.ts#L53-L61](../packages/core/agent-loop/src/agent.ts#L53)、[agent.ts#L160-L168](../packages/core/agent-loop/src/agent.ts#L160)。
+
+### 输入队列：inbox 投影
+
+- 待处理输入分成 `next-turn` 与 `next-step` 两级，由 [`ReactLoopInbox`](../packages/core/agent-loop/src/inbox.ts#L73) 实现。
+- 持久化靠投影 [`inboxProjectionDefinition`](../packages/core/agent-loop/src/inbox.ts#L26)：fold `agent/inbox/spliced` 事件重建队列，坏 splice 抛错（[inbox.ts#L30-L55](../packages/core/agent-loop/src/inbox.ts#L30)）。
+
+### 一个 step 的完整事件流
+
+```mermaid
+sequenceDiagram
+  participant I as Inbox
+  participant L as ReactLoopAgent
+  participant S as Session
+  participant P as ctx.systemPrompt
+  participant LLM as ctx.llm
+  participant T as ToolsPipeline
+  I->>L: 排队输入唤醒 driver
+  L->>S: turn/start
+  L->>S: step/start
+  L->>P: system-prompt/assemble（waterfall）
+  L->>LLM: agent/request → prepareCall → llm/stream
+  LLM-->>L: StreamChunk*
+  L->>S: assistant/message
+  L->>T: executeToolBatch
+  T-->>S: tool/call → tool/result
+  L->>S: step/end
+  L->>S: turn/end
+```
+
+持久事件落账点：`turn/start` [agent.ts#L336](../packages/core/agent-loop/src/agent.ts#L336)、`step/start` [agent.ts#L361](../packages/core/agent-loop/src/agent.ts#L361)、`assistant/message` [agent.ts#L505](../packages/core/agent-loop/src/agent.ts#L505)、`turn/end` [agent.ts#L422](../packages/core/agent-loop/src/agent.ts#L422)。模型配置先经 `agent/request` waterfall：[agent.ts#L631](../packages/core/agent-loop/src/agent.ts#L631)。
+
+### 模型选择与系统提示
+
+- 模型选择投影与系统提示投影封装在 [`runtime-context.ts`](../packages/core/agent-loop/src/runtime-context.ts)。
+- [`SystemPromptProjection`](../packages/core/agent-loop/src/runtime-context.ts#L68) 决定渲染后的系统提示如何落到 surface node（append / 替换），而非每次重发。
+
+---
+
+## ACP（Agent Client Protocol）
+
+
+ACP 是“仅自动化”的协议入口：程序通过 **JSON-RPC stdio** 驱动持久化 Harness agent，不承载任何面向人类的 UI。
+
+### 定位与启动
+
+- 包：[`packages/acp/acp/README.md`](../packages/acp/acp/README.md)；profile bundle：[`packages/bundle/acp-app/README.md`](../packages/bundle/acp-app/README.md)。
+- 启动：`pnpm dsh --profile acp`。stdout 只用于 newline-delimited ACP JSON-RPC 帧。
+- 典型客户端：`dsh-subagent-acp`（跨进程子代理）与测试运行器。
+
+### 自动化工作流
+
+```mermaid
+sequenceDiagram
+  participant C as ACP 客户端
+  participant S as dsh --profile acp
+  C->>S: initialize
+  C->>S: session/new（绝对 cwd + 可选 MCP）
+  C->>S: session/set_config_option（model / reasoning_effort）
+  C->>S: session/prompt
+  S-->>C: session/update（committed 语义更新流）
+  C->>S: session/cancel / $/cancel_request
+  C->>S: session/close
+  C->>S: session/list / session/resume（跨进程恢复）
+```
+
+### 协议方法速览
+
+| 调用 | 作用 |
+| --- | --- |
+| `initialize` | 声明 ACP v1 能力与 `session/*` 扩展 |
+| `authenticate` | 立即成功，无需认证 |
+| `session/new` | 创建持久 agent，校验 workspace 与 MCP |
+| `session/list` | 按最新优先分页列出可恢复会话 |
+| `session/resume` | 恢复会话，日志重建但不重放旧更新 |
+| `session/close` | 安静取消、排空更新、销毁后代、刷持久化 |
+| `session/set_config_option` | 更新 `model` / `reasoning_effort` |
+| `session/prompt` | 一次一个 prompt，按序返回更新 |
+| `session/cancel` | 取消在途 prompt 或自主工作 |
+
+### 实现源码映射
+
+| 文件 | 职责 |
+| --- | --- |
+| [`src/index.ts`](../packages/acp/acp/src/index.ts) | 插件入口：Config、连接装配、会话记录、准入/结算、拆除 |
+| [`src/content.ts`](../packages/acp/acp/src/content.ts) | 图像准入与投影、路由复查、prompt 重建 |
+| [`src/codec.ts`](../packages/acp/acp/src/codec.ts) | turn 结束原因到 ACP `stopReason` 的纯映射 |
+| [`src/session.ts`](../packages/acp/acp/src/session.ts) | 会话模块：Agent 句柄、MCP 挂载、模型选择、更新链 |
+| [`src/updates.ts`](../packages/acp/acp/src/updates.ts) | 语义更新序列化交付 |
+| [`src/mcp.ts`](../packages/acp/acp/src/mcp.ts) | MCP server 挂载与信任模型 |
+
+核心承诺：**只发标准语义更新**、**能力与配置状态真实可验证**、**结算前达到静默**（quiescence）。
+
+---
+
+---
+
+## Hooks 钩子桥接
+
+Hooks 让已有的 **Claude Code / Codex hooks** 在 `dsh` 中继续生效：把参考工具里的 hooks 规则映射到 Harness 的 `agent/*` / `tools/*` 事件上，不需要为同样逻辑写原生 Cordis 插件。
+
+### 包与分工
+
+- 共享规则：[`dsh-hook-protocol`](../packages/experimental/hook-protocol/README.md)：定义“hook 能做什么、运行时发生什么”，两个桥接共用。
+- Claude Code 方言：[`dsh-hooks-claude-code`](../packages/experimental/hooks-claude-code/README.md)。
+- Codex 方言：[`dsh-hooks-codex`](../packages/experimental/hooks-codex/README.md)。
+
+用户不直接装 `hook-protocol`，而是挂其中一个桥接并指向已有的 `hooks.json`。
+
+### 一个 hook 能做什么
+
+- **拦截动作**：以 exit code 2 退出 = 阻止本次 prompt 或 tool call，stderr 作为原因展示给模型。
+- **请求确认**：Claude Code hook 可在工具运行前请求确认；Codex 桥不暴露该选项。
+- **附加上下文**：hook 返回的文本进入下一次请求，模型可见。
+- **按时机触发**：配置用事件名或正则选择触发点；缺省/空/`'*'` 表示该类型全部事件。
+- **失败不打断**：除 exit code 2 外的失败只记录日志，不阻止 agent。
+- **请求停止**：`{"continue": false}` 会被记录，但当前没有 run 级效果（见各 README 的 Known Limitations）。
+
+只有 `command` handler 会执行；`http` / `mcp_tool` / `prompt` / `agent` 会被跳过并告警。
+
+### 处理流水线
+
+```mermaid
+flowchart LR
+  CFG[hooks.json / config] --> SEL[selectHookGroups 选择匹配组]
+  SEL --> RUN[经 dsh-shell 执行 command]
+  RUN --> DEC[decode 解码 exit code / stdout]
+  DEC --> MERGE[合并多个 hook 结果<br/>deny > ask > allow]
+  MERGE --> REC[记录 hook/invoked 与 hook/result]
+  MERGE --> EV[映射到 agent/* / tools/* 决策]
+  EV --> MODEL[block 原因 / 附加上下文 进入模型]
+```
+
+每一步都降级为“包含性结果”，不会抛错打断当前 turn：非法正则是“不匹配”，执行器拒绝变成无 exit code 的 `HookOutput`，exit 2 用 stderr 作为 block 原因，其余失败保持非阻塞。
+
+### Codex 支持面
+
+Codex 当前 10 个 hook 事件中，本桥支持 `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`Stop`；`PermissionRequest`、`PreCompact`、`PostCompact`、`SubagentStart`、`SubagentStop` 暂不支持，相关配置解析时被丢弃。详细限制见 [`hooks-codex` 的 Known Limitations](../packages/experimental/hooks-codex/README.md#known-limitations-and-deferred-work)。
+
+
+
+## 开发实践步骤
+
+
+### 阶段 0：把环境跑起来
+
+```sh
+git clone https://github.com/deepseek-ai/deepseek-harness.git
+cd deepseek-harness
+corepack enable          # 启用 pnpm 11.28.5
+pnpm install             # 安装依赖并配置 Lefthook hooks
+pnpm run typecheck       # 首次克隆后跑一次
+pnpm run build
+pnpm dsh web             # 起 Web UI（默认 http://127.0.0.1:3080）
+```
+
+前提：Node.js `>= 24.9` 且支持 TypeScript type stripping；不要用 `NODE_OPTIONS=--no-experimental-strip-types`。详见 [`docs/development.md`](../docs/development.md)。
+
+### 阶段 1：先懂 Cordis
+
+- 概念速查：读 [`docs/cordis-primer.md`](../docs/cordis-primer.md)。
+- 动手教程：从 [`docs/cordis-tutorial/index.md`](../docs/cordis-tutorial/index.md) 开始，逐章完成 7 个可运行示例：
+
+```text
+1. 第一个插件        —— 插件是一个函数，loader 挂载它
+2. 生命周期与副作用  —— 注册随插件卸载被撤销
+3. 服务             —— 在 ctx 上暴露能力，用 inject 依赖
+4. 事件             —— 类型化事件、广播、waterfall 短路
+5. 配置             —— 从 cordis.yml 校验配置，坏输入响亮失败
+6. 组合与 HMR       —— 配置作为插件树、热重载、诊断未加载
+7. 进入 harness     —— 对真实服务注册一个模型可调工具
+```
+
+教程目录就是本仓库的 `tmp/cordis-tutorial/`（gitignored），每个章节运行：
+
+```sh
+cd tmp/cordis-tutorial
+node --import tsx ../../vendor/cordis/bin.js
+```
+
+### 阶段 2：读懂整体架构
+
+- 必读 [`docs/architecture.md`](../docs/architecture.md)：profile/bundle、能力接缝、Agent 循环、会话日志、扩展点。
+- 看图：`docs/agent-lifecycle.md`、`docs/tool-execution-pipeline.md`、`docs/capability-seams.md`。
+- 看包图：`docs/module-graph.md`、`docs/graph-atlas.md`。
+
+### 阶段 3：掌握包布局
+
+- 总地图读 [`packages/README.md`](../packages/README.md)。
+- 重点先看 `packages/core/`：`agent`、`agent-loop`、`session`、`tools`、`system-prompt`。
+- 看一个接缝全家桶，推荐 `shell`：Service Definition → 本地 provider → 模型工具 Consumer。
+
+### 阶段 4：真实运行与最小改动
+
+```sh
+pnpm dsh --profile headless "summarize this workspace"   # 需要 DEEPSEEK_API_KEY
+pnpm run dev:web                                          # Web 热重载开发
+```
+
+最小改动练习（都带分步指南）：
+
+- [`docs/cookbook/adding-a-tool.md`](../docs/cookbook/adding-a-tool.md)：加一个模型工具。
+- [`docs/cookbook/adding-an-llm-adapter.md`](../docs/cookbook/adding-an-llm-adapter.md)：加 LLM adapter。
+- [`docs/cookbook/adding-a-package.md`](../docs/cookbook/adding-a-package.md)：加 npm 包。
+- [`docs/cookbook/adding-a-settings-card.md`](../docs/cookbook/adding-a-settings-card.md)：加设置页。
+
+### 阶段 5：按仓库规范贡献
+
+- 改 `packages/` 前必读 [`docs/architecture.md`](../docs/architecture.md)；文档改动遵循 [`docs/AGENTS.md`](../docs/AGENTS.md)。
+- 每次提交前跑“最小覆盖集”，不要默认全量测试：
+  - 行为改动 → 聚焦单测 + 快照。
+  - 文档 → `pnpm run doc-sync`。
+  - 发布路径/构建产物 → `pnpm run build` + `pnpm run hygiene`。
+- 非平凡改动必须在同一 PR 写 Agent Note，见 [`.agents/notes/README.md`](../.agents/notes/README.md)。
+
+### 学习路线图
+
+```mermaid
+flowchart TD
+  A[0. 环境跑通<br/>install / typecheck / build] --> B[1. Cordis 概念 + 教程 7 章]
+  B --> C[2. 总架构 architecture.md]
+  C --> D[3. 包布局 packages/README.md]
+  D --> E[4. 真实运行 headless / web]
+  E --> F[5. 最小改动：加工具 / adapter / 包]
+  F --> G[6. 测试与门禁 + Agent Note]
+```
+
+---
+
+## 文件索引
+
+
+常用入口文件与目录（相对本手册的路径，点击可跳转）：
+
+- 项目总览：[`README.md`](../README.md)
+- 架构：[`docs/architecture.md`](../docs/architecture.md)
+- Cordis 概念：[`docs/cordis-primer.md`](../docs/cordis-primer.md)
+- Cordis 教程：[`docs/cordis-tutorial/index.md`](../docs/cordis-tutorial/index.md)
+- 开发指南：[`docs/development.md`](../docs/development.md)
+- 测试策略：[`docs/testing.md`](../docs/testing.md)
+- 能力接缝：[`docs/capability-seams.md`](../docs/capability-seams.md)
+- Agent 生命周期：[`docs/agent-lifecycle.md`](../docs/agent-lifecycle.md)
+- 工具流水线：[`docs/tool-execution-pipeline.md`](../docs/tool-execution-pipeline.md)
+- 包间依赖图：[`docs/module-graph.md`](../docs/module-graph.md)
+- 文档图索引：[`docs/graph-atlas.md`](../docs/graph-atlas.md)
+- 包分组：[`packages/README.md`](../packages/README.md)
+- 核心包：[`packages/core/README.md`](../packages/core/README.md)
+- 扩展指南目录：[`docs/cookbook/`](../docs/cookbook/)
+- 子系统参考：[`docs/subsystems/`](../docs/subsystems/)
+- Agent Notes：[`.agents/notes/README.md`](../.agents/notes/README.md)
+- 仓库门禁脚本：[`scripts/`](../scripts/)
+
+---
+
+## 命令速查
+
+
+| 命令 | 用途 |
+| --- | --- |
+| `pnpm run typecheck` | TypeScript 全量类型检查 |
+| `pnpm run lint` | oxlint |
+| `pnpm run test` | vitest 单元测试 |
+| `pnpm run test:coverage` | CI 覆盖率门禁 |
+| `pnpm run test:snapshot` | keyless 快照测试 |
+| `pnpm run build` | tsc + tsdown 产物构建 |
+| `pnpm run hygiene` | knip + publint + workspace 约束 |
+| `pnpm run doc-sync` | 文档全部门禁 |
+| `pnpm run duplication` | 跨文件 TS 克隆检测 |
+| `pnpm dsh web` | 从源码启动 Web UI |
+| `pnpm dsh --profile headless "task"` | 一次性 Headless 任务 |
